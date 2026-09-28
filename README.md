@@ -1,5 +1,8 @@
 # [S]harded [E]xpirable [Cache] (se-cache)
 
+[![Build Status](https://github.com/goodman116/se-cache/workflows/build/badge.svg)](https://github.com/goodman116/se-cache/actions)
+[![Coverage Status](https://coveralls.io/repos/github/goodman116/se-cache/badge.svg?branch=master)](https://coveralls.io/github/goodman116/se-cache?branch=master)
+
 An ultra-low overhead, sharded, concurrent TTL cache designed specifically to manage heavy read/write traffic under loads exceeding **20,000 RPS**. Built from scratch using **Go 1.22** native constraint rules.
 
 This cache is widely inspired by [go-pkgz/expirable-cache](https://github.com/go-pkgz/expirable-cache).
