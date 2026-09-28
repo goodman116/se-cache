@@ -1,3 +1,5 @@
+// Package cache implements a highly-concurrent, sharded in-memory cache
+// engineered specifically for loads exceeding 20,000+ RPS.
 package cache
 
 import (
@@ -101,6 +103,7 @@ type shard[V any] struct {
 	items map[Key]item[V]
 }
 
+// Stats holds snapshot representations of tracking telemetry hit and miss metrics.
 type Stats struct {
 	Hits      int64 `json:"hits"`
 	Misses    int64 `json:"misses"`
@@ -252,18 +255,20 @@ func (c *cacheImpl[V]) evict(sh *shard[V], limit int) {
 		return
 	}
 
-	for i := range count {
-		if now > sampledExps[i] {
-			targetKey := sampledKeys[i]
-			targetVal := sh.items[targetKey].value
+	for i := 0; i < count && i < evictionSample; i++ {
+		if now <= sampledExps[i] {
+			continue
+		}
 
-			delete(sh.items, targetKey)
-			c.expired.Add(1)
-			c.callOnEvicted(targetKey, targetVal)
+		targetKey := sampledKeys[i]
+		targetVal := sh.items[targetKey].value
 
-			if len(sh.items) < limit {
-				return
-			}
+		delete(sh.items, targetKey)
+		c.expired.Add(1)
+		c.callOnEvicted(targetKey, targetVal)
+
+		if len(sh.items) < limit {
+			return
 		}
 	}
 

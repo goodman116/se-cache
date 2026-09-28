@@ -4,6 +4,7 @@ import (
 	"time"
 )
 
+// Options outlines the customizable fluent builder rules for configuration management.
 type Options[V any] interface {
 	WithMaxKeys(maxKeys int) Cache[V]
 	WithDefaultTTL(ttl time.Duration) Cache[V]

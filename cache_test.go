@@ -40,7 +40,7 @@ func TestSingleFlightRing_StampedeProtection(t *testing.T) {
 	// Create explicit mock hash inputs
 	key := Key{Hi: uint64(999999), Lo: uint64(888888)}
 
-	var executions int64
+	var executions atomic.Int64
 	var wg sync.WaitGroup
 
 	concurrentWorkers := 50
@@ -55,7 +55,7 @@ func TestSingleFlightRing_StampedeProtection(t *testing.T) {
 
 			// Direct pass of raw hash identifiers without old intermediate adapters
 			res, err := sf.Do(key, func() (string, error) {
-				atomic.AddInt64(&executions, 1)
+				executions.Add(1)
 				time.Sleep(25 * time.Millisecond) // Mock network/database roundtrip latency
 				return "cache_stampede_shielded", nil
 			})
@@ -69,58 +69,55 @@ func TestSingleFlightRing_StampedeProtection(t *testing.T) {
 	close(startBarrier)
 	wg.Wait()
 
-	finalCount := atomic.LoadInt64(&executions)
+	finalCount := executions.Load()
 	if finalCount != 1 {
 		t.Fatalf("expected exactly 1 execution, concurrent callers dogpiled: %d", finalCount)
 	}
 }
 
-func TestCache_ConcurrentStressRace(t *testing.T) {
-	c := New[string]().WithMaxKeys(1000).WithClockInterval(5 * time.Millisecond).WithCleanupInterval(10 * time.Millisecond).Start()
+func TestCache_ConcurrentStressRace(_ *testing.T) {
+	c := New[string]().WithMaxKeys(100).WithClockInterval(5 * time.Millisecond).WithCleanupInterval(10 * time.Millisecond).Start()
 	defer c.Close()
 
 	var wg sync.WaitGroup
-	workers := 100
-	opsPerWorker := 1000
+	var workers uint64 = 100
+	var opsPerWorker uint64 = 1000
 
-	wg.Add(workers * 3)
+	wg.Add(int(workers) * 3)
 
 	// Writer Loop
-	for i := 0; i < workers; i++ {
-		uWorkerID := uint64(i)
+	for i := range workers {
 		go func(workerID uint64) {
 			defer wg.Done()
-			for j := 0; j < opsPerWorker; j++ {
-				key := Key{Hi: uint64(j % 50), Lo: workerID}
+			for j := range opsPerWorker {
+				key := Key{Hi: j % 50, Lo: workerID}
 				c.Set(key, "payload", 50*time.Millisecond)
 			}
-		}(uWorkerID)
+		}(i)
 	}
 
 	// Reader Loop
-	for i := 0; i < workers; i++ {
-		uWorkerID := uint64(i)
+	for i := range workers {
 		go func(workerID uint64) {
 			defer wg.Done()
-			for j := 0; j < opsPerWorker; j++ {
-				key := Key{Hi: uint64(j % 50), Lo: workerID}
+			for j := range opsPerWorker {
+				key := Key{Hi: j % 50, Lo: workerID}
 				_, _ = c.Get(key)
 			}
-		}(uWorkerID)
+		}(i)
 	}
 
 	// Invalidator Loop
-	for i := 0; i < workers; i++ {
-		uWorkerID := uint64(i)
+	for i := range workers {
 		go func(workerID uint64) {
 			defer wg.Done()
-			for j := 0; j < opsPerWorker; j++ {
-				key := Key{Hi: uint64(j % 50), Lo: workerID}
+			for j := range opsPerWorker {
+				key := Key{Hi: j % 50, Lo: workerID}
 				if j%10 == 0 {
 					c.Invalidate(key)
 				}
 			}
-		}(uWorkerID)
+		}(i)
 	}
 
 	wg.Wait()
@@ -128,34 +125,35 @@ func TestCache_ConcurrentStressRace(t *testing.T) {
 
 func TestCache_EvictionCeilingAndCallbackLeaks(t *testing.T) {
 	var evictedCount atomic.Int64
-	maxKeys := 10000
 
-	c := New[int]().
-		WithMaxKeys(maxKeys).
-		WithOnEvicted(func(key Key, val int) {
+	const maxKeys uint64 = 10000
+	const loadFactor uint64 = 5
+	const totalInsertions uint64 = maxKeys * loadFactor
+
+	c := New[uint64]().
+		WithMaxKeys(int(maxKeys)).
+		WithOnEvicted(func(_ Key, _ uint64) {
 			evictedCount.Add(1)
 		}).
 		Start()
 	defer c.Close()
 
-	// Push 5x more elements than the configured ceiling capacity
-	for i := 0; i < maxKeys*5; i++ {
-		key := Key{Hi: uint64(i), Lo: uint64(i)}
+	for i := range totalInsertions {
+		key := Key{Hi: i, Lo: i}
 		c.SetDefault(key, i)
 	}
 
-	// Shard limit is integer division based, minor padding account can exist per shard baseline
-	currentLen := c.Len()
-	if currentLen > maxKeys {
+	currentLen := int64(c.Len())
+	if currentLen > int64(maxKeys) {
 		t.Fatalf("Cache breached hard ceiling limit restriction. Max: %d, Found: %d", maxKeys, currentLen)
 	}
 
-	// Give async callbacks a brief window to finish executing
+	// Give async callbacks a brief window to finish executing in the background ring
 	time.Sleep(50 * time.Millisecond)
 
-	totalTracked := int64(currentLen) + evictedCount.Load()
-	if totalTracked != int64(maxKeys*5) {
-		t.Fatalf("Memory leak or dropped items detected. Total acknowledged objects tracking dropped: %d vs expected %d", totalTracked, maxKeys*5)
+	totalTracked := currentLen + evictedCount.Load()
+	if totalTracked != int64(totalInsertions) {
+		t.Fatalf("Memory leak or dropped items detected. Total objects tracked: %d vs expected %d", totalTracked, totalInsertions)
 	}
 }
 
@@ -163,9 +161,9 @@ func TestCache_GoroutineLifecycleLeakCheck(t *testing.T) {
 	initialGoroutines := runtime.NumGoroutine()
 
 	// Create and instantiate 50 distinct isolated cache systems
-	for i := 0; i < 50; i++ {
+	for i := range uint64(50) {
 		c := New[string]().WithMaxKeys(100).Start()
-		c.SetDefault(Key{Hi: 1, Lo: uint64(i)}, "data")
+		c.SetDefault(Key{Hi: 1, Lo: i}, "data")
 		c.Close() // Explicit shutdown verification
 	}
 

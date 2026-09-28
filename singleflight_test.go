@@ -68,9 +68,8 @@ func TestSingleFlight_ConcurrentReadSerialization(t *testing.T) {
 
 	barrier := make(chan struct{})
 
-	for i := 0; i < workers; i++ {
-		uWorkerID := uint64(i)
-		go func(id uint64) {
+	for i := range workers {
+		go func(id int) {
 			defer wg.Done()
 			<-barrier // Block to synchronize simultaneous goroutine wake-ups
 
@@ -83,7 +82,7 @@ func TestSingleFlight_ConcurrentReadSerialization(t *testing.T) {
 			if err != nil || res != 2026 {
 				t.Errorf("Worker %d received corrupted data: res=%d, err=%v", id, res, err)
 			}
-		}(uWorkerID)
+		}(i)
 	}
 
 	// Release the barrier to trigger a cache stampede

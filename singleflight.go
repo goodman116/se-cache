@@ -35,12 +35,14 @@ func NewSingleFlightRing[V any]() *SingleFlightRing[V] {
 	}
 }
 
+func (g *SingleFlightRing[V]) getShard(key Key) *flightShard[V] {
+	return &g.shards[key.Lo&g.shardMask]
+}
+
 // Do ensures only one execution routine fires simultaneously for overlapping hash keys.
 // Fully protected against downstream callback panics using a single causeless defer block.
 func (g *SingleFlightRing[V]) Do(key Key, fn func() (V, error)) (V, error) {
-	const mask int64 = shardCount - 1
-	shardIdx := int64(key.Lo) & mask
-	sh := &g.shards[shardIdx]
+	sh := g.getShard(key)
 
 	sh.mu.Lock()
 	if c, exists := sh.calls[key]; exists {
