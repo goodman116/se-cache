@@ -177,3 +177,85 @@ func TestCache_GoroutineLifecycleLeakCheck(t *testing.T) {
 		t.Fatalf("Goroutine memory leak detected after closing instances. Started with %d, holding %d active routines", initialGoroutines, finalGoroutines)
 	}
 }
+
+// TestCache_ShardCollisionSeparation verifies that if two keys route to the
+// exact same shard (same lower 6 bits) but have different high bits, they
+// are isolated completely and do not overwrite or corrupt each other.
+func TestCache_ShardCollisionSeparation(t *testing.T) {
+	c := New[string]().Start()
+	defer c.Close()
+
+	// Both Lo values end in 4 (4 & 63 == 4), routing them to Shard #4.
+	// Their Hi values are distinct, making them separate keys in the map.
+	keyA := Key{Hi: 100, Lo: 4}
+	keyB := Key{Hi: 200, Lo: 4}
+
+	c.SetDefault(keyA, "payload-alpha")
+	c.SetDefault(keyB, "payload-beta")
+
+	valA, foundA := c.Get(keyA)
+	if !foundA || valA != "payload-alpha" {
+		t.Fatalf("KeyA corrupted or lost in shard collision: %s", valA)
+	}
+
+	valB, foundB := c.Get(keyB)
+	if !foundB || valB != "payload-beta" {
+		t.Fatalf("KeyB corrupted or lost in shard collision: %s", valB)
+	}
+}
+
+// TestCache_StateManagementAndTelemetry validates global administrative commands
+// like Purge, Peek, InvalidateFn, and Stat collections across all shards.
+func TestCache_StateManagementAndTelemetry(t *testing.T) {
+	c := New[string]().WithMaxKeys(100).Start()
+	defer c.Close()
+
+	keyA := Key{Hi: 11, Lo: 11}
+	keyB := Key{Hi: 22, Lo: 22}
+
+	c.SetDefault(keyA, "data-a")
+	c.SetDefault(keyB, "data-b")
+
+	// 1. Verify Peek does not mutate hits/misses telemetry counters
+	if _, found := c.Peek(keyA); !found {
+		t.Fatal("expected Peek to find keyA")
+	}
+	initialStats := c.Stat()
+	if initialStats.Hits != 0 || initialStats.Misses != 0 {
+		t.Fatalf("Peek incorrectly modified telemetry registers: %+v", initialStats)
+	}
+
+	// 2. Validate InvalidateFn matching predicate paths
+	c.InvalidateFn(func(k Key) bool {
+		return k.Hi == 11
+	})
+
+	if _, found := c.Get(keyA); found {
+		t.Fatal("expected keyA to be wiped by InvalidateFn")
+	}
+	if _, found := c.Get(keyB); !found {
+		t.Fatal("expected keyB to remain unaffected by predicate sweep")
+	}
+
+	// 3. Verify global state Purge and alignment
+	c.Purge()
+	if totalKeys := len(c.Keys()); totalKeys != 0 {
+		t.Fatalf("Purge failed to wipe allocation matrix cleanly, left: %d keys", totalKeys)
+	}
+}
+
+// TestCache_RemoveOldestManual validates that the RemoveOldest administrative
+// method safely sweeps a random shard without failing or causing deadlocks.
+func TestCache_RemoveOldestManual(_ *testing.T) {
+	c := New[string]().Start()
+	defer c.Close()
+
+	// Fill multiple shards with arbitrary data
+	for i := range uint64(100) {
+		c.SetDefault(Key{Hi: i, Lo: i}, "evict-test")
+	}
+
+	// RemoveOldest samples a random shard and evicts.
+	// This call must execute smoothly without throwing panic warnings.
+	c.RemoveOldest()
+}
