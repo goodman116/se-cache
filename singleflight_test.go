@@ -120,3 +120,72 @@ func TestSingleFlight_ErrorBubbling(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestSingleFlight_TransientErrorIsolation confirms that when a downstream call returns
+// an explicit error token, the ring clears and allows immediate subsequent retries.
+func TestSingleFlight_TransientErrorIsolation(t *testing.T) {
+	sf := NewSingleFlightRing[string]()
+	key := Key{Hi: 555, Lo: 555}
+	mockErr := errors.New("transient database connection timeout")
+
+	// Execute an operation that fails
+	_, err := sf.Do(key, func() (string, error) {
+		return "", mockErr
+	})
+	if err == nil {
+		t.Fatal("expected singleflight worker to bubble up error token")
+	}
+
+	// Immediate retry path must execute and succeed if the downstream has recovered
+	successVal, err := sf.Do(key, func() (string, error) {
+		return "recovered_payload", nil
+	})
+
+	if err != nil || successVal != "recovered_payload" {
+		t.Fatalf("Singleflight ring failed to clear transient error tracking slots: err=%v", err)
+	}
+}
+
+// TestSingleFlight_PassengerOrderOfOperations validates that passenger goroutines
+// wait cleanly for the single leader execution to finalize before reading,
+// ensuring proper sequential synchronization under heavy concurrency loops.
+func TestSingleFlight_PassengerOrderOfOperations(t *testing.T) {
+	sf := NewSingleFlightRing[string]()
+	key := Key{Hi: 888, Lo: 888}
+
+	var leaderStarted atomic.Int32
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	// Leader Flight
+	go func() {
+		defer wg.Done()
+		_, _ = sf.Do(key, func() (string, error) {
+			leaderStarted.Store(1)
+			time.Sleep(20 * time.Millisecond)
+			return "done", nil
+		})
+	}()
+
+	// Passenger Flight
+	go func() {
+		defer wg.Done()
+		// Sleep briefly to guarantee the leader acquires the tracking flight seat first
+		time.Sleep(5 * time.Millisecond)
+
+		res, err := sf.Do(key, func() (string, error) {
+			return "interrupted_invalid_execution", nil
+		})
+
+		if err != nil || res != "done" {
+			t.Errorf("Passenger woke up prematurely or fetched invalid payload data: %s", res)
+		}
+
+		if leaderStarted.Load() != 1 {
+			t.Error("Passenger bypassed synchronization plane execution rules")
+		}
+	}()
+
+	wg.Wait()
+}
