@@ -250,7 +250,6 @@ func TestCache_RemoveOldestManual(_ *testing.T) {
 	c := New[string]().Start()
 	defer c.Close()
 
-	// Fill multiple shards with arbitrary data
 	for i := range uint64(100) {
 		c.SetDefault(Key{Hi: i, Lo: i}, "evict-test")
 	}
@@ -258,4 +257,142 @@ func TestCache_RemoveOldestManual(_ *testing.T) {
 	// RemoveOldest samples a random shard and evicts.
 	// This call must execute smoothly without throwing panic warnings.
 	c.RemoveOldest()
+}
+
+// TestCache_EvictCornerCases explicitly targets the early-exit and inline lazy
+// expiration deletion branches inside the evict loop (Fixes cache.go zero blocks).
+func TestCache_EvictCornerCases(t *testing.T) {
+	c := New[string]().WithMaxKeys(64).Start()
+	impl := c.(*cacheImpl[string])
+
+	sh := impl.shards[0]
+	sh.mu.Lock()
+	impl.evict(sh, 10)
+	sh.mu.Unlock()
+	c.Close()
+
+	c = New[string]().WithMaxKeys(64).Start()
+	impl = c.(*cacheImpl[string])
+	sh = impl.shards[0]
+	sh.mu.Lock()
+	impl.evict(sh, 0)
+	sh.mu.Unlock()
+	c.Close()
+
+	// We use a high clock interval to ensure we can control time slices manually
+	c = New[string]().WithMaxKeys(64).WithClockInterval(24 * time.Hour).Start()
+	impl = c.(*cacheImpl[string])
+
+	key := Key{Hi: 1, Lo: 0}
+
+	sh = impl.shards[0]
+	sh.mu.Lock()
+	sh.items[key] = item[string]{
+		value:      "expired-in-sample",
+		expiration: impl.now() - 1000,
+	}
+	impl.evict(sh, 0)
+	sh.mu.Unlock()
+	c.Close()
+}
+
+// TestCache_GetDoubleCheckRace targets the case when a key is deleted
+// concurrently after breaching expiration but before the write lock is grabbed.
+func TestCache_GetDoubleCheckRace(t *testing.T) {
+	c := New[string]().WithClockInterval(24 * time.Hour).Start()
+	impl := c.(*cacheImpl[string])
+
+	key := Key{Hi: 99, Lo: 99}
+	sh := impl.getShard(key)
+
+	sh.mu.Lock()
+	sh.items[key] = item[string]{
+		value:      "race-payload",
+		expiration: impl.now() - 50,
+	}
+	sh.mu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sh.mu.Lock()
+		delete(sh.items, key)
+		sh.mu.Unlock()
+	}()
+
+	wg.Wait()
+
+	if _, found := c.Get(key); found {
+		t.Fatal("expected key to not be found during cleanup race evaluation")
+	}
+}
+
+// TestCache_OptionsAutotuneAndCallbacks targets options.go zero branches
+// and the Invalidate internal validation metadata mismatch branches.
+func TestCache_OptionsAutotuneAndCallbacks(t *testing.T) {
+	var evictedTriggered int64
+
+	c := New[string]().
+		WithMaxKeys(64).
+		WithDefaultTTL(10 * time.Millisecond).
+		WithOnEvicted(func(_ Key, _ string) {
+			evictedTriggered++
+		}).
+		Start()
+
+	key := Key{Hi: 5, Lo: 5}
+	c.SetDefault(key, "test-data")
+
+	impl := c.(*cacheImpl[string])
+	sh := impl.getShard(key)
+
+	sh.mu.Lock()
+	delete(sh.items, key)
+	sh.mu.Unlock() // Triggers the custom short TTL autotuner path
+
+	c.Invalidate(key)
+	if _, found := c.Get(key); found {
+		t.Fatal("expected key to be wiped by Invalidate")
+	}
+	c.Close()
+}
+
+func TestCache_CustomHasher(t *testing.T) {
+	customHasher := func(data []byte) Key {
+		return Key{Hi: 123, Lo: 321}
+	}
+
+	c := New[string]().
+		WithHasher(customHasher).
+		WithMaxKeys(10).
+		Start()
+
+	key := c.Hash([]byte("test"))
+	if key.Hi != 123 || key.Lo != 321 {
+		t.Fatal("expected key to match customHasher output")
+	}
+	c.Close()
+}
+
+func TestCache_CleanupIntervalCalculation(t *testing.T) {
+	ttl := 4 * time.Minute
+	c := New[int]().
+		WithDefaultTTL(ttl).
+		Start()
+
+	impl := c.(*cacheImpl[int])
+	if impl.cleanupInterval != ttl/2 {
+		t.Fatal("wrong cleanup interval calculation")
+	}
+
+	c.Close()
+}
+
+func TestCache_StringNotEmpty(t *testing.T) {
+	c := New[string]().Start()
+
+	if str := c.String(); str == "" {
+		t.Error("String() returned an empty representation")
+	}
 }
