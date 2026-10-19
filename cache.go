@@ -419,12 +419,13 @@ func (c *cacheImpl[V]) DeleteExpired() {
 }
 
 func (c *cacheImpl[V]) Purge() {
+	limit := c.perShardLimit()
 	for _, sh := range c.shards {
 		sh.mu.Lock()
 		for k, v := range sh.items {
 			c.callOnEvicted(k, v.value)
 		}
-		sh.items = make(map[Key]item[V])
+		sh.items = make(map[Key]item[V], limit)
 		sh.mu.Unlock()
 	}
 }
