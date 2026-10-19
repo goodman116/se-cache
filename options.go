@@ -55,11 +55,10 @@ func (c *cacheImpl[V]) Start() Cache[V] {
 		}
 	}
 
-	if c.maxSize > 0 {
-		perShardCap := max(1, c.maxSize/shardCount)
+	if limit := c.perShardLimit(); limit > 0 {
 		for _, sh := range c.shards {
 			sh.mu.Lock()
-			sh.items = make(map[Key]item[V], perShardCap)
+			sh.items = make(map[Key]item[V], limit)
 			sh.mu.Unlock()
 		}
 	}

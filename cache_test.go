@@ -76,7 +76,11 @@ func TestSingleFlightRing_StampedeProtection(t *testing.T) {
 }
 
 func TestCache_ConcurrentStressRace(_ *testing.T) {
-	c := New[string]().WithMaxKeys(100).WithClockInterval(5 * time.Millisecond).WithCleanupInterval(10 * time.Millisecond).Start()
+	c := New[string]().
+		WithMaxKeys(100).
+		WithClockInterval(5 * time.Millisecond).
+		WithCleanupInterval(10 * time.Millisecond).
+		Start()
 	defer c.Close()
 
 	var wg sync.WaitGroup
@@ -164,12 +168,12 @@ func TestCache_GoroutineLifecycleLeakCheck(t *testing.T) {
 	for i := range uint64(50) {
 		c := New[string]().WithMaxKeys(100).Start()
 		c.SetDefault(Key{Hi: 1, Lo: i}, "data")
-		c.Close() // Explicit shutdown verification
+		c.Close()
 	}
 
 	// Yield to scheduler to let dead routines exit clean
 	runtime.GC()
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	finalGoroutines := runtime.NumGoroutine()
 	// Allow a tiny slack variance threshold for generic background runtime systems
@@ -212,6 +216,7 @@ func TestCache_StateManagementAndTelemetry(t *testing.T) {
 
 	keyA := Key{Hi: 11, Lo: 11}
 	keyB := Key{Hi: 22, Lo: 22}
+	keyC := Key{Hi: 33, Lo: 33}
 
 	c.SetDefault(keyA, "data-a")
 	c.SetDefault(keyB, "data-b")
@@ -219,6 +224,9 @@ func TestCache_StateManagementAndTelemetry(t *testing.T) {
 	// 1. Verify Peek does not mutate hits/misses telemetry counters
 	if _, found := c.Peek(keyA); !found {
 		t.Fatal("expected Peek to find keyA")
+	}
+	if _, found := c.Peek(keyC); found {
+		t.Fatal("expected Peek not to find keyC")
 	}
 	initialStats := c.Stat()
 	if initialStats.Hits != 0 || initialStats.Misses != 0 {
@@ -246,60 +254,63 @@ func TestCache_StateManagementAndTelemetry(t *testing.T) {
 
 // TestCache_RemoveOldestManual validates that the RemoveOldest administrative
 // method safely sweeps a random shard without failing or causing deadlocks.
-func TestCache_RemoveOldestManual(_ *testing.T) {
+func TestCache_RemoveOldestManual(t *testing.T) {
 	c := New[string]().Start()
 	defer c.Close()
 
-	for i := range uint64(100) {
-		c.SetDefault(Key{Hi: i, Lo: i}, "evict-test")
+	size := 1000
+
+	for i := size; i > 0; i-- {
+		val := uint64(i)
+		c.Set(Key{Hi: val, Lo: val}, "evict-test", time.Duration(i)*time.Second)
 	}
 
 	// RemoveOldest samples a random shard and evicts.
 	// This call must execute smoothly without throwing panic warnings.
 	c.RemoveOldest()
+	if totalKeys := len(c.Keys()); totalKeys == size {
+		t.Fatal("RemoveOldest failed to clean up anything")
+	}
 }
 
 // TestCache_EvictCornerCases explicitly targets the early-exit and inline lazy
-// expiration deletion branches inside the evict loop (Fixes cache.go zero blocks).
+// expiration deletion branches inside the evict loop.
 func TestCache_EvictCornerCases(t *testing.T) {
-	c := New[string]().WithMaxKeys(64).Start()
+	c := New[string]().
+		WithMaxKeys(64).
+		WithClockInterval(24 * time.Hour).
+		Start()
+	defer c.Close()
+
 	impl := c.(*cacheImpl[string])
-
-	sh := impl.shards[0]
-	sh.mu.Lock()
-	impl.evict(sh, 10)
-	sh.mu.Unlock()
-	c.Close()
-
-	c = New[string]().WithMaxKeys(64).Start()
-	impl = c.(*cacheImpl[string])
-	sh = impl.shards[0]
-	sh.mu.Lock()
-	impl.evict(sh, 0)
-	sh.mu.Unlock()
-	c.Close()
-
-	// We use a high clock interval to ensure we can control time slices manually
-	c = New[string]().WithMaxKeys(64).WithClockInterval(24 * time.Hour).Start()
-	impl = c.(*cacheImpl[string])
 
 	key := Key{Hi: 1, Lo: 0}
 
-	sh = impl.shards[0]
+	sh := impl.shards[0]
+	// early exit if cache is empty
+	impl.evict(sh, 0)
+
 	sh.mu.Lock()
 	sh.items[key] = item[string]{
 		value:      "expired-in-sample",
 		expiration: impl.now() - 1000,
 	}
-	impl.evict(sh, 0)
 	sh.mu.Unlock()
-	c.Close()
+	before := c.Len()
+	sh.mu.Lock()
+	impl.evict(sh, 2)
+	sh.mu.Unlock()
+	after := c.Len()
+	if before != after {
+		t.Fatal("early exit")
+	}
 }
 
 // TestCache_GetDoubleCheckRace targets the case when a key is deleted
 // concurrently after breaching expiration but before the write lock is grabbed.
 func TestCache_GetDoubleCheckRace(t *testing.T) {
 	c := New[string]().WithClockInterval(24 * time.Hour).Start()
+	defer c.Close()
 	impl := c.(*cacheImpl[string])
 
 	key := Key{Hi: 99, Lo: 99}
@@ -331,35 +342,37 @@ func TestCache_GetDoubleCheckRace(t *testing.T) {
 // TestCache_OptionsAutotuneAndCallbacks targets options.go zero branches
 // and the Invalidate internal validation metadata mismatch branches.
 func TestCache_OptionsAutotuneAndCallbacks(t *testing.T) {
-	var evictedTriggered int64
+	var evictedTriggered atomic.Int32
+	var wg sync.WaitGroup
 
 	c := New[string]().
 		WithMaxKeys(64).
 		WithDefaultTTL(10 * time.Millisecond).
 		WithOnEvicted(func(_ Key, _ string) {
-			evictedTriggered++
+			defer wg.Done()
+			evictedTriggered.Add(1)
 		}).
 		Start()
+	defer c.Close()
 
 	key := Key{Hi: 5, Lo: 5}
 	c.SetDefault(key, "test-data")
-
-	impl := c.(*cacheImpl[string])
-	sh := impl.getShard(key)
-
-	sh.mu.Lock()
-	delete(sh.items, key)
-	sh.mu.Unlock() // Triggers the custom short TTL autotuner path
+	wg.Add(1)
 
 	c.Invalidate(key)
 	if _, found := c.Get(key); found {
 		t.Fatal("expected key to be wiped by Invalidate")
 	}
-	c.Close()
+
+	wg.Wait()
+
+	if evictedTriggered.Load() != 1 {
+		t.Fatal("expected WithOnEvicted to be invoked")
+	}
 }
 
 func TestCache_CustomHasher(t *testing.T) {
-	customHasher := func(data []byte) Key {
+	customHasher := func(_ []byte) Key {
 		return Key{Hi: 123, Lo: 321}
 	}
 
@@ -367,12 +380,12 @@ func TestCache_CustomHasher(t *testing.T) {
 		WithHasher(customHasher).
 		WithMaxKeys(10).
 		Start()
+	defer c.Close()
 
 	key := c.Hash([]byte("test"))
 	if key.Hi != 123 || key.Lo != 321 {
 		t.Fatal("expected key to match customHasher output")
 	}
-	c.Close()
 }
 
 func TestCache_CleanupIntervalCalculation(t *testing.T) {
@@ -380,17 +393,16 @@ func TestCache_CleanupIntervalCalculation(t *testing.T) {
 	c := New[int]().
 		WithDefaultTTL(ttl).
 		Start()
+	defer c.Close()
 
 	impl := c.(*cacheImpl[int])
 	if impl.cleanupInterval != ttl/2 {
 		t.Fatal("wrong cleanup interval calculation")
 	}
-
-	c.Close()
 }
 
 func TestCache_StringNotEmpty(t *testing.T) {
-	c := New[string]().Start()
+	c := New[string]()
 
 	if str := c.String(); str == "" {
 		t.Error("String() returned an empty representation")

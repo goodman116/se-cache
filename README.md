@@ -64,7 +64,7 @@ func main() {
 
 ## Custom Hashing Strategy (Extensibility)
 
-By default, the cache utilizes `DefaultHasher` (powered by [zeebo/xxh3](github.com/zeebo/xxh3)) under the hood for zero-allocation key token projections. If your application layer demands alternative constraints (e.g., cryptographic verification or custom cluster-wide salting registers), you can inject an explicit custom hasher signature block using the `WithHasher(fn HasherFn)` option.
+By default, the cache utilizes `DefaultHasher` (powered by [zeebo/xxh3](https://github.com/zeebo/xxh3)) under the hood for zero-allocation key token projections. If your application layer demands alternative constraints (e.g., cryptographic verification or custom cluster-wide salting registers), you can inject an explicit custom hasher signature block using the `WithHasher(fn HasherFn)` option.
 
 ```go
 package main
